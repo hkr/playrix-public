@@ -8,26 +8,28 @@
 
 #ifdef WIN32
 #include <windows.h>
-#pragma warning(push)
-#pragma warning(disable : 4458)
-#include <gdiplus.h>
-#pragma warning(pop)
+#else
+#include <pthread.h>
 #endif
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
 #include <smmintrin.h> // SSE4.1
-#include <atomic>
 #include <chrono>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <condition_variable>
 #include <vector>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "../stb/stb_image.h"
+
+#define STB_IMAGE_WRITE_IMPLEMENTATION
+#include "../stb/stb_image_write.h"
+
 #ifndef WIN32
-#include <boost/thread.hpp>
 #ifdef __APPLE__
 #include <libkern/OSByteOrder.h>
 #else
@@ -36,8 +38,6 @@
 #endif
 
 #ifdef WIN32
-#pragma comment(lib, "gdiplus.lib")
-
 #define INLINED __forceinline
 #define NOTINLINED __declspec(noinline)
 #define M128I_I32(mm, index) ((mm).m128i_i32[index])
@@ -147,20 +147,12 @@ static INLINED uint32_t BROR(uint32_t x)
 
 static INLINED uint32_t BSWAP(uint32_t x)
 {
-#ifdef __APPLE__
-	return OSSwapInt32(x);
-#else
-	return bswap_32(x);
-#endif
+	return __builtin_bswap32(x);
 }
 
 static INLINED uint64_t BSWAP64(uint64_t x)
 {
-#ifdef __APPLE__
-	return OSSwapInt64(x);
-#else
-	return bswap_64(x);
-#endif
+	return __builtin_bswap64(x);
 }
 
 static INLINED uint32_t BROR(uint32_t x)
@@ -5389,12 +5381,9 @@ public:
 	};
 
 protected:
-#ifdef WIN32
-	CRITICAL_SECTION _Sync;
-	HANDLE _Done;
-#else
+
 	std::mutex _Sync;
-#endif
+	std::condition_variable _Done;
 
 	Job* _First;
 	Job* _Last;
@@ -5402,22 +5391,13 @@ protected:
 	int64_t _mse;
 	double _ssim;
 
-	std::atomic_int _Running;
+	int _Running;
 
 	PackMode _Mode;
 
 public:
 	Worker()
 	{
-#ifdef WIN32
-		if (!InitializeCriticalSectionAndSpinCount(&_Sync, 1000))
-			throw std::runtime_error("init");
-
-		_Done = CreateEvent(NULL, FALSE, FALSE, NULL);
-		if (_Done == nullptr)
-			throw std::runtime_error("init");
-#endif
-
 		_First = nullptr;
 		_Last = nullptr;
 	}
@@ -5432,31 +5412,16 @@ public:
 		}
 
 		_Last = nullptr;
-
-#ifdef WIN32
-		if (_Done != nullptr)
-			CloseHandle(_Done), _Done = nullptr;
-
-		DeleteCriticalSection(&_Sync);
-#endif
 	}
 
 	void Lock()
 	{
-#ifdef WIN32
-		EnterCriticalSection(&_Sync);
-#else
 		_Sync.lock();
-#endif
 	}
 
 	void UnLock()
 	{
-#ifdef WIN32
-		LeaveCriticalSection(&_Sync);
-#else
 		_Sync.unlock();
-#endif
 	}
 
 	void Add(Job* job)
@@ -5491,7 +5456,7 @@ protected:
 #ifdef WIN32
 	static DWORD WINAPI ThreadProc(LPVOID lpParameter)
 #else
-	static int ThreadProc(Worker* lpParameter)
+	static void* ThreadProc(void* lpParameter)
 #endif
 	{
 		Worker* worker = static_cast<Worker*>(lpParameter);
@@ -5574,17 +5539,14 @@ protected:
 
 		worker->_mse += mse;
 		worker->_ssim += ssim;
-
-		worker->UnLock();
-
 		worker->_Running--;
 
-#ifdef WIN32
 		if (worker->_Running <= 0)
 		{
-			SetEvent(worker->_Done);
+			worker->_Done.notify_all();
 		}
-#endif
+
+		worker->UnLock();
 
 		return 0;
 	}
@@ -5608,143 +5570,44 @@ public:
 				throw std::runtime_error("fork");
 			CloseHandle(hthread);
 #else
-			boost::thread::attributes attrs;
-			attrs.set_stack_size(WorkerThreadStackSize);
-			boost::thread thread(attrs, boost::bind(ThreadProc, this));
-			thread.detach();
+			pthread_attr_t attr;
+			pthread_attr_init(&attr);
+			pthread_attr_setstacksize(&attr, WorkerThreadStackSize);
+			pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+			pthread_t thread;
+			pthread_create(&thread, &attr, ThreadProc, this);
+			pthread_attr_destroy(&attr);
 #endif
 		}
 
-#ifdef WIN32
-		WaitForSingleObject(_Done, INFINITE);
-#else
-		for (;; )
-		{
-			std::this_thread::yield();
-
-			if (_Running <= 0)
-				break;
-		}
-#endif
+		std::unique_lock<std::mutex> lock(_Sync);
+		while (_Running > 0)
+			_Done.wait(lock);
 
 		return _mm_unpacklo_epi64(_mm_cvtsi64_si128(_mse), _mm_castpd_si128(_mm_load_sd((double*)&_ssim)));
 	}
 };
 
-#ifdef WIN32
-
 static bool ReadImage(const char* src_name, uint8_t* &pixels, int &width, int &height, bool flip)
 {
-	ULONG_PTR gdiplusToken;
-
-	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-	Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-	{
-		std::wstring wide_src_name;
-		wide_src_name.resize(std::mbstowcs(nullptr, src_name, MAX_PATH));
-		std::mbstowcs(&wide_src_name.front(), src_name, MAX_PATH);
-
-		Gdiplus::Bitmap bitmap(wide_src_name.c_str(), FALSE);
-
-		width = (int)bitmap.GetWidth();
-		height = (int)bitmap.GetHeight();
-
-		Gdiplus::Rect rect(0, 0, width, height);
-		Gdiplus::BitmapData data;
-		if (bitmap.LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &data) == 0)
-		{
-			int stride = width << 2;
-
-			pixels = new uint8_t[height * stride];
-
-			uint8_t* w = pixels;
-			for (int y = 0; y < height; y++)
-			{
-				const uint8_t* r = (const uint8_t*)data.Scan0 + (flip ? height - 1 - y : y) * data.Stride;
-				memcpy(w, r, stride);
-				w += stride;
-			}
-
-			bitmap.UnlockBits(&data);
-		}
-		else
-		{
-			pixels = nullptr;
-		}
-	}
-	Gdiplus::GdiplusShutdown(gdiplusToken);
-
+	stbi_set_flip_vertically_on_load(flip ? 1 : 0);
+	int n = 0;
+	pixels = stbi_load(src_name, &width, &height, &n, 4);
 	return pixels != nullptr;
 }
 
 static void WriteImage(const char* dst_name, const uint8_t* pixels, int w, int h, bool flip)
 {
-	ULONG_PTR gdiplusToken;
-
-	Gdiplus::GdiplusStartupInput gdiplusStartupInput;
-	Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, NULL);
-	{
-		Gdiplus::Bitmap bitmap(w, h, PixelFormat32bppARGB);
-
-		Gdiplus::Rect rect(0, 0, w, h);
-		Gdiplus::BitmapData data;
-		if (bitmap.LockBits(&rect, Gdiplus::ImageLockModeWrite, PixelFormat32bppARGB, &data) == 0)
-		{
-			for (int y = 0; y < h; y++)
-			{
-				memcpy((uint8_t*)data.Scan0 + (flip ? h - 1 - y : y) * data.Stride, pixels + y * w * 4, w * 4);
-			}
-
-			bitmap.UnlockBits(&data);
-		}
-
-		CLSID format;
-		bool ok = false;
-		{
-			UINT num, size;
-			Gdiplus::GetImageEncodersSize(&num, &size);
-			if (size >= num * sizeof(Gdiplus::ImageCodecInfo))
-			{
-				Gdiplus::ImageCodecInfo* pArray = (Gdiplus::ImageCodecInfo*)new uint8_t[size];
-				Gdiplus::GetImageEncoders(num, size, pArray);
-
-				for (UINT i = 0; i < num; ++i)
-				{
-					if (pArray[i].FormatID == Gdiplus::ImageFormatPNG)
-					{
-						format = pArray[i].Clsid;
-						ok = true;
-						break;
-					}
-				}
-
-				delete[](uint8_t*)pArray;
-			}
-		}
-		if (ok)
-		{
-			std::wstring wide_dst_name;
-			wide_dst_name.resize(std::mbstowcs(nullptr, dst_name, MAX_PATH));
-			std::mbstowcs(&wide_dst_name.front(), dst_name, MAX_PATH);
-
-			ok = (bitmap.Save(wide_dst_name.c_str(), &format) == Gdiplus::Ok);
-		}
-
-		printf(ok ? "  Saved %s\n" : "Lost %s\n", dst_name);
-	}
-	Gdiplus::GdiplusShutdown(gdiplusToken);
+	stbi_write_png(dst_name, w, h, 4, pixels, w * 4);
 }
 
 static void LoadEtc2(const char* name, uint8_t* buffer, int size)
 {
-	HANDLE file = CreateFile(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
-	if (file != INVALID_HANDLE_VALUE)
+	FILE* file = fopen(name, "rb");
+	if (file != NULL)
 	{
-		DWORD transferred;
-		BOOL ok = ReadFile(file, buffer, size, &transferred, NULL);
-
-		CloseHandle(file);
-
+		bool ok = fread(buffer, size, 1, file) == 1;
+		fclose(file);
 		if (ok)
 		{
 			printf("    Loaded %s\n", name);
@@ -5756,19 +5619,15 @@ static void SaveEtc2(const char* name, const uint8_t* buffer, int size)
 {
 	bool ok = false;
 
-	HANDLE file = CreateFile(name, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-	if (file != INVALID_HANDLE_VALUE)
+	FILE* file = fopen(name, "wb");
+	if (file != NULL)
 	{
-		DWORD transferred;
-		ok = (WriteFile(file, buffer, size, &transferred, NULL) != 0);
-
-		CloseHandle(file);
+		ok = fwrite(buffer, size, 1, file) == 1;
+		fclose(file);
 	}
 
 	printf(ok ? "    Saved %s\n" : "Lost %s\n", name);
 }
-
-#endif
 
 static __m128i PackTexture(uint8_t* dst_etc1, uint8_t* src_bgra, int src_w, int src_h, PackMode mode, size_t block_size)
 {
@@ -6078,7 +5937,7 @@ int Etc2MainWithArgs(const std::vector<std::string>& args)
 
 	delete[] dst_texture_bgra;
 	delete[] src_texture_bgra;
-	delete[] src_image_bgra;
+	stbi_image_free(src_image_bgra);
 
 	return 0;
 }
